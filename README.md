@@ -61,4 +61,4 @@ En local `QDRANT_API_KEY` peut rester vide. Si Qdrant n’est plus sur localhost
 
 ## Liens
 
-- Support de présentation : _à coller_
+- Support de présentation : `docs/soutenance.pptx`
