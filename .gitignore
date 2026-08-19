@@ -7,3 +7,6 @@ __pycache__/
 data/raw/
 data/process/
 qdrant_storage/
+data/backups/
+.agents/
+.claude/

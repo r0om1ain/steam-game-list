@@ -1,0 +1,12 @@
+pandas
+numpy
+matplotlib
+seaborn
+pyarrow
+python-dotenv
+requests
+tqdm
+sentence-transformers
+qdrant-client
+streamlit
+plotly
