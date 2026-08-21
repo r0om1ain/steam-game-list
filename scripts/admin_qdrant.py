@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
+import tarfile
+import time
 from pathlib import Path
+
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import SnapshotPriority
 
 from qdrant_utils import ROOT, collection_name, get_client
 
@@ -27,6 +33,64 @@ def find_snapshot_file(coll: str, name: str) -> Path | None:
     if p.exists():
         return p
     return None
+
+
+def snapshot_sparse_corrupt_reason(path: Path) -> str | None:
+    """Docker Desktop + Windows bind-mount snapshots often store small files as GNU sparse holes."""
+    with tarfile.open(path, "r:") as archive:
+        members = archive.getmembers()
+        for member in members:
+            if member.issparse() and (
+                member.name.endswith("wal/first-index")
+                or member.name.endswith("newest_clocks.json")
+            ):
+                return member.name
+        nested = next((m for m in members if m.name.endswith(".tar") and "/segments/" in m.name), None)
+        if nested is None:
+            return None
+        extracted = archive.extractfile(nested)
+        if extracted is None:
+            return None
+        with tarfile.open(fileobj=extracted, mode="r:") as inner:
+            for member in inner.getmembers():
+                if member.issparse() and member.name.endswith("version.info"):
+                    return f"{nested.name} -> {member.name}"
+    return None
+
+
+def wait_for_qdrant(timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            get_client().get_collections()
+            return
+        except Exception as exc:
+            last_err = exc
+            time.sleep(1)
+    raise SystemExit(f"Qdrant pas joignable après {timeout:.0f}s : {last_err}")
+
+
+def wipe_broken_collection(coll: str) -> None:
+    """Stop Qdrant and drop the on-disk collection after a failed restore/WAL crash."""
+    print("collection cassée, reset du dossier via docker…")
+    subprocess.run(["docker", "compose", "stop", "qdrant"], cwd=ROOT, check=True)
+    coll_dir = STORAGE / "collections" / coll
+    if coll_dir.exists():
+        shutil.rmtree(coll_dir)
+        print("supprimé :", coll_dir)
+    subprocess.run(["docker", "compose", "start", "qdrant"], cwd=ROOT, check=True)
+    wait_for_qdrant()
+
+
+def collection_is_usable(client, coll: str) -> bool:
+    try:
+        if not client.collection_exists(coll):
+            return False
+        client.get_collection(coll)
+        return True
+    except UnexpectedResponse:
+        return False
 
 
 def cmd_info(_args):
@@ -54,7 +118,26 @@ def cmd_info(_args):
 def cmd_snapshot(_args):
     client = get_client()
     coll = collection_name()
-    snap = client.create_snapshot(collection_name=coll)
+    before = {s.name for s in (client.list_snapshots(collection_name=coll) or [])}
+
+    print("création du snapshot…")
+    started = client.create_snapshot(collection_name=coll, wait=False)
+    expected = getattr(started, "name", None)
+
+    deadline = time.monotonic() + 600
+    snap = None
+    while time.monotonic() < deadline:
+        listed = client.list_snapshots(collection_name=coll) or []
+        if expected:
+            snap = next((s for s in listed if s.name == expected), None)
+        else:
+            snap = next((s for s in listed if s.name not in before), None)
+        if snap is not None:
+            break
+        time.sleep(1)
+    if snap is None:
+        raise SystemExit("timeout: snapshot pas listé après 10 min (Qdrant bloqué ?)")
+
     print("snapshot créé :", snap.name)
 
     BACKUPS.mkdir(parents=True, exist_ok=True)
@@ -81,7 +164,7 @@ def cmd_list(_args):
 
 
 def cmd_restore(args):
-    client = get_client()
+    client = get_client(timeout=600)
     coll = collection_name()
     name = args.name
 
@@ -94,11 +177,34 @@ def cmd_restore(args):
         src = dest_dir / name
         print("snapshot recopié dans le volume :", src)
 
+    if src is not None:
+        reason = snapshot_sparse_corrupt_reason(src)
+        if reason:
+            raise SystemExit(
+                "snapshot inutilisable : fichiers métadonnées vides (GNU sparse) "
+                f"({reason}).\n"
+                "Cause typique : volume Docker bind-mounté depuis Windows.\n"
+                "Relance l'index : python scripts/ingest_qdrant.py --recreate"
+            )
+
+    if collection_is_usable(client, coll):
+        print("suppression de", coll, "avant restore…")
+        client.delete_collection(coll)
+    else:
+        try:
+            leftover = client.collection_exists(coll)
+        except UnexpectedResponse:
+            leftover = True
+        if leftover:
+            wipe_broken_collection(coll)
+            client = get_client(timeout=600)
+
     location = f"file:///qdrant/storage/snapshots/{coll}/{Path(name).name}"
     print("recover depuis", location)
     client.recover_snapshot(
         collection_name=coll,
         location=location,
+        priority=SnapshotPriority.SNAPSHOT,
         wait=True,
     )
     print("restore ok, count =", client.count(coll).count)
